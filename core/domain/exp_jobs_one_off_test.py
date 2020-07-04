@@ -22,11 +22,14 @@ from __future__ import unicode_literals  # pylint: disable=import-only-modules
 import ast
 import datetime
 import logging
+import os
 
 from core.domain import exp_domain
 from core.domain import exp_fetchers
 from core.domain import exp_jobs_one_off
 from core.domain import exp_services
+from core.domain import fs_domain
+from core.domain import fs_services
 from core.domain import html_cleaner
 from core.domain import html_validation_service
 from core.domain import rights_manager
@@ -35,6 +38,7 @@ from core.domain import user_services
 from core.platform import models
 from core.tests import test_utils
 import feconf
+import python_utils
 import utils
 
 (job_models, exp_models, base_models, classifier_models) = (
@@ -2727,3 +2731,424 @@ class ExplorationMockMathMigrationOneOffJobOneOffJobTests(
             exp_jobs_one_off
             .ExplorationMockMathMigrationOneOffJob.get_output(job_id))
         self.assertEqual(len(actual_output), 0)
+
+
+class VoiceoverDurationSecondsOneOffJobTests(test_utils.GenericTestBase):
+    ONE_OFF_JOB_MANAGERS_FOR_TESTS = [
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob]
+
+    VALID_EXP_ID = 'exp_id0'
+
+    USERNAME_A = 'usernamea'
+    EMAIL_A = 'emaila@example.com'
+    TEST_AUDIO_FILE_MP3 = 'cafe.mp3'
+    AUDIO_UPLOAD_URL_PREFIX = '/createhandler/audioupload'
+    _FILENAME_PREFIX = 'audio'
+
+    def setUp(self):
+        super(VoiceoverDurationSecondsOneOffJobTests, self).setUp()
+        self.signup(self.EMAIL_A, self.USERNAME_A)
+
+        self.user_a_id = self.get_user_id_from_email(self.EMAIL_A)
+        self.process_and_flush_pending_tasks()
+
+    def test_voiceover_duration_secs_job_fails_with_invalid_exploration(self):
+        observed_log_messages = []
+
+        def _mock_logging_function(msg, *args):
+            """Mocks logging.error()."""
+            observed_log_messages.append(msg % args)
+
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='title', category='category')
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        exploration_model = exp_models.ExplorationModel.get(self.VALID_EXP_ID)
+        exploration_model.language_code = 'invalid_language_code'
+        exploration_model.commit(
+            self.user_a_id, 'Changed language_code.', [])
+        memcache_services.delete('exploration:%s' % self.VALID_EXP_ID)
+
+        job_id = exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new()
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        with self.swap(logging, 'error', _mock_logging_function):
+            self.process_and_flush_pending_tasks()
+
+        self.assertEqual(
+            observed_log_messages,
+            ['Exploration %s failed non-strict validation: '
+             'Invalid language_code: invalid_language_code'
+             % (self.VALID_EXP_ID)])
+
+    def test_jobs_fails_when_audio_file_is_not_found(self):
+        observed_log_messages = []
+
+        def _mock_logging_function(msg, *args):
+            """Mocks logging.error()."""
+            observed_log_messages.append(msg % args)
+
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='title', category='category')
+        state_name = 'State1'
+        exploration.add_states([state_name])
+        state1 = exploration.states[state_name]
+        recorded_voiceovers_dict = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 0.0
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+
+        state1.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(recorded_voiceovers_dict))
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        job_id = exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new()
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        with self.swap(logging, 'error', _mock_logging_function):
+            self.process_and_flush_pending_tasks()
+
+        relative_path = ('File %s/%s not found.' % (self._FILENAME_PREFIX,
+                                                    self.TEST_AUDIO_FILE_MP3))
+        self.assertEqual(
+            observed_log_messages,
+            ['MP3 audio file exception for file %s ,EXP_ID: %s,'
+             'STATE_NAME: %s,REASON: %s' % (
+                 self.TEST_AUDIO_FILE_MP3, self.VALID_EXP_ID, state_name,
+                 relative_path)])
+        actual_output = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.get_output(
+                job_id)
+            )
+        expected_output = [('[u\'FAILED_NO_CHANGE\', [u\'EXP_ID: exp_id0, '
+                            'FAILED_DURATION_CHANGE: 1\']]')]
+        self.assertEqual(actual_output, expected_output)
+
+    def test_no_action_is_performed_for_deleted_exploration(self):
+        """Test that no action is performed on deleted explorations."""
+        exp_id = '100'
+        self.save_new_valid_exploration(exp_id, self.user_a_id)
+        exp_services.delete_exploration(self.user_a_id, exp_id)
+
+        run_job_for_deleted_exp(
+            self, exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob)
+
+    def test_minimum_allowed_state_schema_version(self):
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='Exploration Title 1', category='category')
+        exploration.add_states(['State1'])
+        # Test with the unaccepted state_schema_version
+        # for duration_secs which is less than 31.
+        exploration.states_schema_version = 30
+        state1 = exploration.states['State1']
+        recorded_voiceovers_dict = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 0.0
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+
+        state1.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(recorded_voiceovers_dict))
+
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        job_id = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new())
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        self.process_and_flush_pending_tasks()
+
+        actual_output = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.get_output(
+                job_id)
+            )
+        expected_output = [('[u\'State schema version is '
+                            'not the minimum version expected, 31\', '
+                            '[u\'EXP_ID: exp_id0, '
+                            'STATE_SCHEMA_VERSION: 30\']]')]
+        self.assertEqual(actual_output, expected_output)
+
+    def test_duration_secs_is_updated_when_job_is_complete(self):
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='Exploration Title 1', category='category')
+        exploration.add_states(['State1'])
+        state1 = exploration.states['State1']
+        recorded_voiceovers_dict = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 0.0
+                    },
+                    'hi': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 0.0
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+
+        # Get the test audio file and prepare for storage.
+        with python_utils.open_file(
+            os.path.join(feconf.TESTS_DATA_DIR, self.TEST_AUDIO_FILE_MP3),
+            mode='rb', encoding=None) as f:
+            raw_audio = f.read()
+
+        mimetype = 'audio/mp3'
+
+        # Save the raw audio into the filesystem.
+        file_system_class = fs_services.get_entity_file_system_class()
+        fs = fs_domain.AbstractFileSystem(file_system_class(
+            feconf.ENTITY_TYPE_EXPLORATION, self.VALID_EXP_ID))
+        fs.commit(
+            '%s/%s' % (self._FILENAME_PREFIX, self.TEST_AUDIO_FILE_MP3),
+            raw_audio, mimetype=mimetype)
+
+        # Save the recorded_voiceovers.
+        state1.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(recorded_voiceovers_dict))
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        # Run the job.
+        job_id = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new())
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        self.process_and_flush_pending_tasks()
+
+        actual_output = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.get_output(
+                job_id)
+            )
+        # Validate job ran successfully.
+        expected_output = [('[u\'SUCCESS_AUDIO_CHANGED\', [u\'EXP_ID: exp_id0, '
+                            'AUDIO_DURATIONS_CHANGED: 2\']]')]
+        self.assertEqual(actual_output, expected_output)
+
+        updated_exploration = (
+            exp_fetchers.get_exploration_by_id(self.VALID_EXP_ID).to_dict())
+        expected_updated_value = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 15.255510204081633
+                    },
+                    'hi': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 15.255510204081633
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+        actual_value = (
+            updated_exploration['states']['State1']['recorded_voiceovers'])
+        # Validate the data is updated in the exploration correctly.
+        self.assertEqual(expected_updated_value, actual_value)
+
+    def test_should_not_update_value_when_job_is_run(self):
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='Exploration Title 1', category='category')
+        exploration.add_states(['State1'])
+        state1 = exploration.states['State1']
+        recorded_voiceovers_dict = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 12.0
+                    },
+                    'hi': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 14.0
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+
+        # Save the recorded_voiceovers.
+        state1.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(recorded_voiceovers_dict))
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        # Run the job.
+        job_id = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new())
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        self.process_and_flush_pending_tasks()
+
+        actual_output = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.get_output(
+                job_id)
+            )
+        # Validate job ran successfully.
+        # Check for no change count to be updated.
+        expected_output = [('[u\'SUCCESS_NO_CHANGE\', [u\'EXP_ID: exp_id0, '
+                            'NO_DURATIONS_CHANGED: 2\']]')]
+        self.assertEqual(actual_output, expected_output)
+
+    def test_job_should_run_on_states_that_are_applicable(self):
+        exploration = exp_domain.Exploration.create_default_exploration(
+            self.VALID_EXP_ID, title='Exploration Title 1', category='category')
+        exploration.add_states(['State1'])
+        exploration.add_states(['State2'])
+        state1 = exploration.states['State1']
+        state2 = exploration.states['State2']
+        recorded_voiceovers_dict_state1 = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 0.0
+                    },
+                    'hi': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 0.0
+                    }
+                },
+                'default_outcome': {}
+            }
+        }
+
+        recorded_voiceovers_dict_state2 = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': 'state2_content_en.mp3',
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 4.0
+                    },
+                    'hi': {
+                        'filename': 'state2_content_hi.mp3',
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 11.0
+                    }
+                },
+                'default_outcome': {},
+            }
+        }
+
+        # Get the test audio file and prepare for storage.
+        with python_utils.open_file(
+            os.path.join(feconf.TESTS_DATA_DIR, self.TEST_AUDIO_FILE_MP3),
+            mode='rb', encoding=None) as f:
+            raw_audio = f.read()
+
+        mimetype = 'audio/mp3'
+
+        # Save the raw audio into the filesystem.
+        file_system_class = fs_services.get_entity_file_system_class()
+        fs = fs_domain.AbstractFileSystem(file_system_class(
+            feconf.ENTITY_TYPE_EXPLORATION, self.VALID_EXP_ID))
+        fs.commit(
+            '%s/%s' % (self._FILENAME_PREFIX, self.TEST_AUDIO_FILE_MP3),
+            raw_audio, mimetype=mimetype)
+
+        # Save the recorded_voiceovers and states.
+        state1.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(
+                recorded_voiceovers_dict_state1))
+        state2.update_recorded_voiceovers(
+            state_domain.RecordedVoiceovers.from_dict(
+                recorded_voiceovers_dict_state2))
+        exp_services.save_new_exploration(self.user_a_id, exploration)
+
+        # Run the job.
+        job_id = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.create_new())
+        exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.enqueue(job_id)
+        self.process_and_flush_pending_tasks()
+
+        actual_output = (
+            exp_jobs_one_off.VoiceoverDurationSecondsOneOffJob.get_output(
+                job_id)
+            )
+        # Validate job ran successfully.
+        expected_output = [('[u\'SUCCESS_AUDIO_CHANGED\', [u\'EXP_ID: exp_id0, '
+                            'AUDIO_DURATIONS_CHANGED: 2\']]'),
+                           ('[u\'SUCCESS_NO_CHANGE\', [u\'EXP_ID: exp_id0, '
+                            'NO_DURATIONS_CHANGED: 2\']]')]
+        self.assertEqual(actual_output, expected_output)
+
+        updated_exploration = (
+            exp_fetchers.get_exploration_by_id(self.VALID_EXP_ID).to_dict())
+        expected_updated_value_state1 = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 15.255510204081633
+                    },
+                    'hi': {
+                        'filename': self.TEST_AUDIO_FILE_MP3,
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 15.255510204081633
+                    }
+                },
+                'default_outcome': {},
+            }
+        }
+        expected_updated_value_state2 = {
+            'voiceovers_mapping': {
+                'content': {
+                    'en': {
+                        'filename': 'state2_content_en.mp3',
+                        'file_size_bytes': 123,
+                        'needs_update': True,
+                        'duration_secs': 4.0
+                    },
+                    'hi': {
+                        'filename': 'state2_content_hi.mp3',
+                        'file_size_bytes': 1234,
+                        'needs_update': False,
+                        'duration_secs': 11.0
+                    }
+                },
+                'default_outcome': {},
+            }
+        }
+        actual_value_state1 = (
+            updated_exploration['states']['State1']['recorded_voiceovers'])
+        actual_value_state2 = (
+            updated_exploration['states']['State2']['recorded_voiceovers'])
+        # Validate the data is updated in the exploration correctly.
+        # Only State1 should be updated. State2 should remain unchanged.
+        self.assertEqual(expected_updated_value_state1, actual_value_state1)
+        self.assertEqual(expected_updated_value_state2, actual_value_state2)

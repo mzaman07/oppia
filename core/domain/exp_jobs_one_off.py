@@ -29,6 +29,7 @@ from core import jobs
 from core.domain import exp_domain
 from core.domain import exp_fetchers
 from core.domain import exp_services
+from core.domain import fs_domain
 from core.domain import html_validation_service
 from core.domain import rights_manager
 from core.platform import models
@@ -36,6 +37,8 @@ import feconf
 import python_utils
 import schema_utils
 import utils
+
+from mutagen import mp3
 
 from pylatexenc import latex2text
 
@@ -665,3 +668,112 @@ class InteractionCustomizationArgsValidationJob(
         else:
             output_values.append(key[exp_id_index:])
             yield (key[:exp_id_index - 1], output_values)
+
+
+class VoiceoverDurationSecondsOneOffJob(jobs.BaseMapReduceOneOffJobManager):
+    """One-Off Job to set every voiceover's duration to duration_secs with
+    the correct value.
+    """
+
+    @classmethod
+    def entity_classes_to_map_over(cls):
+        return [exp_models.ExplorationModel]
+
+    @staticmethod
+    def map(item):
+        if item.deleted:
+            return
+
+        exploration = exp_fetchers.get_exploration_by_id(item.id)
+        try:
+            exploration.validate()
+        except Exception as e:
+            logging.error(
+                'Exploration %s failed non-strict validation: %s' %
+                (item.id, e))
+            return
+        if (item.states_schema_version <
+                AUDIO_DURATION_SECS_MIN_STATE_SCHEMA_VERSION):
+            yield ('State schema version is not the '
+                   'minimum version expected, 31', 'EXP_ID: %s, '
+                   'STATE_SCHEMA_VERSION: %s' %
+                   (item.id, item.states_schema_version))
+            return
+
+        # Go through each exploration state to find voiceover recordings.
+        # For batching them as commits per explorations.
+        commit_cmds = []
+        exploration_states_changed_count = 0
+        exploration_states_unchanged_count = 0
+        exploration_states_failed_count = 0
+        for state, state_value in item.states.items():
+            state_is_changed = False
+            voiceovers_mapping = (state_value['recorded_voiceovers']
+                                  ['voiceovers_mapping'])
+            language_codes_to_audio_metadata = voiceovers_mapping.values()
+            for language_codes in language_codes_to_audio_metadata:
+                for audio_metadata in language_codes.values():
+                    # Get files using the filename.
+                    filename = audio_metadata['filename']
+                    if audio_metadata['duration_secs'] == 0.0:
+                        try:
+                            fs = fs_domain.AbstractFileSystem(
+                                fs_domain.GcsFileSystem(
+                                    AUDIO_ENTITY_TYPE, item.id))
+                            raw = fs.get('%s/%s' % (
+                                AUDIO_FILE_PREFIX, filename))
+                            # Get the audio-duration from file with Mutagen.
+                            tempbuffer = python_utils.string_io()
+                            tempbuffer.write(raw)
+                            tempbuffer.seek(0)
+                            # Loads audio metadata with Mutagen.
+                            audio = mp3.MP3(tempbuffer)
+                            tempbuffer.close()
+                            # Fetch the audio file duration from the Mutagen
+                            # metadata.
+                            audio_metadata['duration_secs'] = (
+                                audio.info.length)
+                            state_is_changed = True
+                            exploration_states_changed_count += 1
+                        except Exception as e:
+                            logging.error(
+                                'MP3 audio file exception for file %s ,'
+                                'EXP_ID: %s,'
+                                'STATE_NAME: %s,'
+                                'REASON: %s' %
+                                (filename, item.id, state, e))
+                            exploration_states_failed_count += 1
+                    else:
+                        exploration_states_unchanged_count += 1
+            if state_is_changed:
+                # Create commits to update the exploration.
+                # Only when the state is changed.
+                commit_cmds.append(exp_domain.ExplorationChange({
+                    'cmd': exp_domain.CMD_EDIT_STATE_PROPERTY,
+                    'property_name': (
+                        exp_domain.STATE_PROPERTY_RECORDED_VOICEOVERS),
+                    'state_name': state,
+                    'new_value': {
+                        'voiceovers_mapping': voiceovers_mapping
+                    }
+                }))
+        if len(commit_cmds) > 0:
+            exp_services.update_exploration(
+                feconf.MIGRATION_BOT_USERNAME, item.id, commit_cmds,
+                'Update duration in seconds for each voiceover recording '
+                'in the exploration.')
+            yield ('SUCCESS_AUDIO_CHANGED', 'EXP_ID: %s, '
+                   'AUDIO_DURATIONS_CHANGED: %s' %
+                   (item.id, exploration_states_changed_count))
+        if exploration_states_unchanged_count > 0:
+            yield ('SUCCESS_NO_CHANGE', 'EXP_ID: %s, '
+                   'NO_DURATIONS_CHANGED: %s' %
+                   (item.id, exploration_states_unchanged_count))
+        if exploration_states_failed_count > 0:
+            yield ('FAILED_NO_CHANGE', 'EXP_ID: %s, '
+                   'FAILED_DURATION_CHANGE: %s' %
+                   (item.id, exploration_states_failed_count))
+
+    @staticmethod
+    def reduce(key, values):
+        yield (key, values)
